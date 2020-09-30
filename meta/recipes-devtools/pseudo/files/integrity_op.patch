@@ -1,0 +1,303 @@
+Allow "pseudo -Z" to run a DB integrity check 'live' and return an error
+exit code if issues are found.
+
+Signed-off-by: Richard Purdie <richard.purdie@linuxfoundation.org>
+Upstream-Status: Pending
+
+Index: git/enums/msg_type.in
+===================================================================
+--- git.orig/enums/msg_type.in
++++ git/enums/msg_type.in
+@@ -5,3 +5,4 @@ op
+ ack
+ nak
+ fastop
++db-integrity
+Index: git/enums/op.in
+===================================================================
+--- git.orig/enums/op.in
++++ git/enums/op.in
+@@ -27,3 +27,4 @@ remove-xattr, 1
+ set-xattr, 0
+ create-xattr, 1
+ replace-xattr, 1
++
+Index: git/pseudo.c
+===================================================================
+--- git.orig/pseudo.c
++++ git/pseudo.c
+@@ -40,6 +40,7 @@ char *opt_M = NULL;
+ long opt_p = 0;
+ char *opt_r = NULL;
+ int opt_S = 0;
++int opt_Z = 0;
+ 
+ static int pseudo_op(pseudo_msg_t *msg, const char *program, const char *tag, char **response_path, size_t *response_len);
+ static int pseudo_db_check(int fix);
+@@ -101,32 +102,6 @@ main(int argc, char *argv[]) {
+ 	sigaddset(&blocked, SIGUSR2);	/* who knows what people do */
+ 	sigprocmask(SIG_UNBLOCK, &blocked, &saved);
+ 
+-	if (ld_env && strstr(ld_env, "libpseudo")) {
+-		pseudo_debug(PDBGF_SERVER, "[server %d] can't run daemon with libpseudo in %s\n", getpid(), PRELINK_LIBRARIES);
+-		s = pseudo_get_value("PSEUDO_UNLOAD");
+-		if (s) {
+-			pseudo_diag("pseudo: I can't seem to make %s go away.  Sorry.\n", PRELINK_LIBRARIES);
+-			pseudo_diag("pseudo: %s: %s\n", PRELINK_LIBRARIES, ld_env);
+-			exit(PSEUDO_EXIT_PSEUDO_LOADED);
+-		}
+-		free(s);
+-		pseudo_set_value("PSEUDO_UNLOAD", "YES");
+-		pseudo_setupenv();
+-		pseudo_dropenv(); /* Drop PRELINK_LIBRARIES */
+-
+-		execv(argv[0], argv);
+-		exit(PSEUDO_EXIT_PSEUDO_LOADED);
+-	}
+-
+-	/* Be sure to clean PSEUDO_UNLOAD so if we're asked to run any
+-	 * programs pseudo will be active in the process...
+-	 * (note: pseudo_set_value doesn't muck w/ the environment, thus
+-	 *  the need for the unsetenv, which is safe because "pseudo"
+-	 *  is the executable in this case!)
+-	 */
+-	pseudo_set_value("PSEUDO_UNLOAD", NULL);
+-	unsetenv("PSEUDO_UNLOAD");
+-
+ 	/* we need cwd to canonicalize paths */
+ 	pseudo_client_getcwd();
+ 
+@@ -134,7 +109,7 @@ main(int argc, char *argv[]) {
+ 	 * wrong.  The + suppresses this annoying behavior, but may not
+ 	 * be compatible with sane option libraries.
+ 	 */
+-	while ((o = getopt(argc, argv, "+BCdfhi:lm:M:p:P:r:R:St:vVx:")) != -1) {
++	while ((o = getopt(argc, argv, "+BCdfhi:lm:M:p:P:r:R:St:vVx:Z")) != -1) {
+ 		switch (o) {
+ 		case 'B': /* rebuild database */
+ 			opt_B = 1;
+@@ -234,6 +209,9 @@ main(int argc, char *argv[]) {
+ 		case 'x': /* debug flags */
+ 			pseudo_debug_set(optarg);
+ 			break;
++		case 'Z': /* run online database check */
++			opt_Z = 1;
++			break;
+ 		case '?':
+ 		default:
+ 			pseudo_diag("unknown/invalid argument (option '%c').\n", optopt);
+@@ -241,6 +219,37 @@ main(int argc, char *argv[]) {
+ 			break;
+ 		}
+ 	}
++
++	if (opt_Z) {
++		exit(pseudo_client_db_integrity());
++	}
++
++	if (ld_env && strstr(ld_env, "libpseudo")) {
++		pseudo_debug(PDBGF_SERVER, "[server %d] can't run daemon with libpseudo in %s\n", getpid(), PRELINK_LIBRARIES);
++		s = pseudo_get_value("PSEUDO_UNLOAD");
++		if (s) {
++			pseudo_diag("pseudo: I can't seem to make %s go away.  Sorry.\n", PRELINK_LIBRARIES);
++			pseudo_diag("pseudo: %s: %s\n", PRELINK_LIBRARIES, ld_env);
++			exit(PSEUDO_EXIT_PSEUDO_LOADED);
++		}
++		free(s);
++		pseudo_set_value("PSEUDO_UNLOAD", "YES");
++		pseudo_setupenv();
++		pseudo_dropenv(); /* Drop PRELINK_LIBRARIES */
++
++		execv(argv[0], argv);
++		exit(PSEUDO_EXIT_PSEUDO_LOADED);
++	}
++
++	/* Be sure to clean PSEUDO_UNLOAD so if we're asked to run any
++	 * programs pseudo will be active in the process...
++	 * (note: pseudo_set_value doesn't muck w/ the environment, thus
++	 *  the need for the unsetenv, which is safe because "pseudo"
++	 *  is the executable in this case!)
++	 */
++	pseudo_set_value("PSEUDO_UNLOAD", NULL);
++	unsetenv("PSEUDO_UNLOAD");
++
+ 	pseudo_debug_flags_finalize();
+ 	/* Options are processed, preserve them... */
+ 	pseudo_set_value("PSEUDO_OPTS", opts);
+@@ -420,6 +429,74 @@ main(int argc, char *argv[]) {
+ 	return pseudo_server_start(opt_d);
+ }
+ 
++
++int
++pseudo_op_integrity_check(void) {
++	struct stat buf;
++	pseudo_msg_t *m;
++	pdb_file_list l;
++	int rc = 0;
++
++	l = pdb_files();
++	if (!l) {
++		pseudo_diag("Couldn't start file list, can't scan.\n");
++		return;
++	}
++	pseudo_diag("Running runtime integrity check\n");
++	while ((m = pdb_file(l)) != NULL) {
++		pseudo_debug(PDBGF_DB, "m: %p (%d: %s)\n",
++			(void *) m,
++			m ? (int) m->pathlen : -1,
++			m ? m->path : "<n/a>");
++		if (m->pathlen > 0) {
++			if (!strcmp(m->path, "NAMELESS FILE")) {
++				continue;
++			}
++			int fixup_needed = 0;
++			pseudo_debug(PDBGF_DB, "Checking <%s>\n", m->path);
++			if (lstat(m->path, &buf)) {
++				pseudo_diag("INTEGRITY: missing (can't stat) <%s>\n", m->path);
++				rc = 1;
++				continue;
++			}
++			/* can't check for device type mismatches, uid/gid, or
++			 * permissions, because those are the very things we
++			 * can't really set.
++			 */
++			if (buf.st_ino != m->ino) {
++				pseudo_diag("INTEGRITY: ino mismatch <%s>: ino %llu, db %llu\n",
++					m->path,
++					(unsigned long long) buf.st_ino,
++					(unsigned long long) m->ino);
++				rc = 1;
++			}
++			if (buf.st_dev != m->dev) {
++				pseudo_diag("INTEGRITY: dev mismatch <%s>: dev %llu, db %llu\n",
++					m->path,
++					(unsigned long long) buf.st_dev,
++					(unsigned long long) m->dev);
++				rc = 1;
++			}
++			if (S_ISLNK(buf.st_mode) != S_ISLNK(m->mode)) {
++				pseudo_diag("INTEGRITY: symlink mismatch <%s>: file %d, db %d\n",
++					m->path,
++					S_ISLNK(buf.st_mode),
++					S_ISLNK(m->mode));
++				rc = 1;
++			}
++			if (S_ISDIR(buf.st_mode) != S_ISDIR(m->mode)) {
++				pseudo_diag("INTEGRITY: symlink mismatch <%s>: file %d, db %d\n",
++					m->path,
++					S_ISDIR(buf.st_mode),
++					S_ISDIR(m->mode));
++				rc = 1;
++			}
++		}
++	}
++	pdb_files_done(l);
++	return rc;
++}
++
+ /* 
+  * actually process operations.
+  * This first evaluates the message, figures out what's in the DB, does some
+@@ -1050,6 +1127,10 @@ pseudo_server_response(pseudo_msg_t *msg
+ 			pdb_log_msg(SEVERITY_INFO, msg, program, tag, NULL);
+ 		return 0;
+ 		break;
++	case PSEUDO_MSG_DB_INTEGRITY:
++		msg->result = pseudo_op_integrity_check() ? RESULT_FAIL : RESULT_SUCCEED;
++		return 0;
++		break;
+ 	case PSEUDO_MSG_OP:
+ 	case PSEUDO_MSG_FASTOP:
+ 		return pseudo_op(msg, program, tag, response_path, response_len);
+Index: git/pseudo_client.c
+===================================================================
+--- git.orig/pseudo_client.c
++++ git/pseudo_client.c
+@@ -1460,6 +1460,86 @@ pseudo_client_shutdown(int wait_on_socke
+ 	return 0;
+ }
+ 
++int
++pseudo_client_db_integrity() {
++	pseudo_msg_t msg;
++	pseudo_msg_t *ack;
++	char *pseudo_path;
++
++	pseudo_debug(PDBGF_INVOKE, "attempting to shut down server.\n");
++	pseudo_path = pseudo_prefix_path(NULL);
++	if (pseudo_prefix_dir_fd == -1) {
++		if (pseudo_path) {
++			pseudo_prefix_dir_fd = open(pseudo_path, O_RDONLY);
++			/* directory is missing? */
++			if (pseudo_prefix_dir_fd == -1 && errno == ENOENT) {
++				pseudo_debug(PDBGF_CLIENT, "prefix directory doesn't exist, trying to create\n");
++				mkdir_p(pseudo_path);
++				pseudo_prefix_dir_fd = open(pseudo_path, O_RDONLY);
++			}
++			pseudo_prefix_dir_fd = pseudo_fd(pseudo_prefix_dir_fd, COPY_FD);
++			free(pseudo_path);
++		} else {
++			pseudo_diag("No prefix available to to find server.\n");
++			exit(1);
++		}
++		if (pseudo_prefix_dir_fd == -1) {
++			pseudo_diag("Can't open prefix path (%s) for server. (%s)\n",
++				pseudo_prefix_path(NULL),
++				strerror(errno));
++			exit(1);
++		}
++	}
++	pseudo_path = pseudo_localstatedir_path(NULL);
++	mkdir_p(pseudo_path);
++	if (pseudo_localstate_dir_fd == -1) {
++		if (pseudo_path) {
++			pseudo_localstate_dir_fd = open(pseudo_path, O_RDONLY);
++			/* directory is missing? */
++			if (pseudo_localstate_dir_fd == -1 && errno == ENOENT) {
++				pseudo_debug(PDBGF_CLIENT, "local state dir doesn't exist, trying to create\n");
++				mkdir_p(pseudo_path);
++				pseudo_localstate_dir_fd = open(pseudo_path, O_RDONLY);
++			}
++			pseudo_localstate_dir_fd = pseudo_fd(pseudo_localstate_dir_fd, COPY_FD);
++			free(pseudo_path);
++		} else {
++			pseudo_diag("No prefix available to to find server.\n");
++			exit(1);
++		}
++		if (pseudo_localstate_dir_fd == -1) {
++			pseudo_diag("Can't open local state path (%s) for server. (%s)\n",
++				pseudo_localstatedir_path(NULL),
++				strerror(errno));
++			exit(1);
++		}
++	}
++	if (client_connect()) {
++		pseudo_debug(PDBGF_INVOKE, "Pseudo server seems to be already offline.\n");
++		return 0;
++	}
++	memset(&msg, 0, sizeof(pseudo_msg_t));
++	msg.type = PSEUDO_MSG_DB_INTEGRITY;
++	msg.op = OP_NONE;
++	msg.client = getpid();
++	pseudo_debug(PDBGF_CLIENT | PDBGF_SERVER, "sending shutdown request\n");
++	if (pseudo_msg_send(connect_fd, &msg, 0, NULL)) {
++		pseudo_debug(PDBGF_CLIENT | PDBGF_SERVER, "error requesting shutdown: %s\n", strerror(errno));
++		return 1;
++	}
++	ack = pseudo_msg_receive(connect_fd);
++	if (!ack) {
++		pseudo_diag("server did not respond to shutdown query.\n");
++		return 1;
++	}
++	if (ack->result == RESULT_SUCCEED) {
++		pseudo_diag("DB Okay\n");
++		return 0;
++	}
++	pseudo_diag("DB Fail\n");
++	return 1;
++}
++
+ static char *
+ base_path(int dirfd, const char *path, int leave_last) {
+ 	char *basepath = 0;
