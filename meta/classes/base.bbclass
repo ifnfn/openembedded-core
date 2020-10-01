@@ -65,6 +65,29 @@ oe_runmake() {
 	oe_runmake_call "$@" || die "oe_runmake failed"
 }
 
+testpseudo () {
+	pseudo -Z
+}
+
+TESTPSEUDO = "testpseudo"
+TESTPSEUDO_class-native = ""
+TESTPSEUDO_class-cross = ""
+TESTPSEUDO_class-crosssdk = ""
+
+do_install[prefuncs] += "${TESTPSEUDO}"
+do_install[postfuncs] += "${TESTPSEUDO}"
+do_package[prefuncs] =+ "${TESTPSEUDO}"
+do_package[postfuncs] =+ "${TESTPSEUDO}"
+do_package_write_rpm[prefuncs] += "${TESTPSEUDO}"
+do_package_write_rpm[postfuncs] += "${TESTPSEUDO}"
+do_package_write_ipk[prefuncs] += "${TESTPSEUDO}"
+do_package_write_ipk[postfuncs] += "${TESTPSEUDO}"
+do_package_write_deb[prefuncs] += "${TESTPSEUDO}"
+do_package_write_deb[postfuncs] += "${TESTPSEUDO}"
+do_package_qa[prefuncs] += "${TESTPSEUDO}"
+do_package_qa[postfuncs] += "${TESTPSEUDO}"
+
+do_image_complete[postfuncs] =+ "${TESTPSEUDO}"
 
 def base_dep_prepend(d):
     if d.getVar('INHIBIT_DEFAULT_DEPS', False):
